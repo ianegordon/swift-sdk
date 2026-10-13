@@ -29,8 +29,9 @@ import Logging
 /// - Session management is handled externally or not needed
 ///
 /// For full streaming and session support, use ``StatefulHTTPServerTransport`` instead.
+/// A cancelled request ends with an empty SSE response so no JSON-RPC reply is sent.
 public actor StatelessHTTPServerTransport:
-    Transport, HTTPContextProviding, RoutedRequestIDProviding
+    Transport, HTTPContextProviding, RoutedRequestIDProviding, CancelledHTTPExchangeCompleting
 {
     public nonisolated let logger: Logger
 
@@ -50,9 +51,14 @@ public actor StatelessHTTPServerTransport:
 
     // MARK: - Response waiters
 
+    private enum ResponseOutcome {
+        case data(Data)
+        case cancelled
+    }
+
     private struct ResponseWaiter {
         let originalID: ID
-        let continuation: CheckedContinuation<Data, any Error>
+        let continuation: CheckedContinuation<ResponseOutcome, any Error>
     }
 
     /// Maps a transport-private exchange ID to the matching HTTP response waiter.
@@ -136,7 +142,7 @@ public actor StatelessHTTPServerTransport:
             }
             do {
                 let response = try restoringResponseID(in: data, to: waiter.originalID)
-                waiter.continuation.resume(returning: response)
+                waiter.continuation.resume(returning: .data(response))
             } catch {
                 waiter.continuation.resume(throwing: error)
                 throw error
@@ -169,6 +175,9 @@ public actor StatelessHTTPServerTransport:
     /// - **GET**: 405 Method Not Allowed
     /// - **DELETE**: 405 Method Not Allowed
     /// - Others: 405 Method Not Allowed
+    ///
+    /// If the adapter cancels this task because its HTTP exchange ended, it must not write the
+    /// returned response. The adapter owns disconnect and timeout behavior.
     public func handleRequest(_ request: HTTPRequest) async -> HTTPResponse {
         if terminated {
             return .error(
@@ -222,22 +231,9 @@ public actor StatelessHTTPServerTransport:
 
         // Handle by message type
         switch messageKind {
-        case .notification(let method):
-            // A cancellation names a wire id; the Server tracks requests by
-            // exchange id (see `routingRequest`). Resolve and rewrite it *before*
-            // yielding, then complete the exchange *after*: completion tears down
-            // the wire-id → exchange mapping, so resolving afterwards would leave
-            // the Server unable to find the task to cancel.
-            var outgoing = body
-            var cancelled: CancelledExchange?
-            if method == CancelledNotification.name {
-                (outgoing, cancelled) = routingCancellation(body)
-            }
+        case .notification:
             // Yield to server and return 202 Accepted
-            incomingContinuation.yield(outgoing)
-            if let cancelled {
-                completeExchange(cancelled)
-            }
+            incomingContinuation.yield(body)
             return .accepted()
 
         case .response:
@@ -272,14 +268,21 @@ public actor StatelessHTTPServerTransport:
         incomingContinuation.yield(routedBody)
 
         // Wait for the server to process and send a response
-        let responseData: Data
+        let outcome: ResponseOutcome
         do {
-            responseData = try await withCheckedThrowingContinuation { continuation in
-                responseWaiters[exchangeID] = ResponseWaiter(
-                    originalID: originalID,
-                    continuation: continuation
-                )
+            outcome = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    responseWaiters[exchangeID] = ResponseWaiter(
+                        originalID: originalID,
+                        continuation: continuation
+                    )
+                }
+            } onCancel: {
+                Task { await self.cancelWaitingExchange(exchangeID) }
             }
+        } catch MCPError.connectionClosed {
+            removeHTTPContext(exchangeID: exchangeID, requestID: originalID)
+            return .error(statusCode: 503, .connectionClosed)
         } catch {
             removeHTTPContext(exchangeID: exchangeID, requestID: originalID)
             return .error(
@@ -289,7 +292,15 @@ public actor StatelessHTTPServerTransport:
         }
 
         removeHTTPContext(exchangeID: exchangeID, requestID: originalID)
-        return .data(responseData, headers: [HTTPHeaderName.contentType: ContentType.json])
+        switch outcome {
+        case .data(let responseData):
+            return .data(responseData, headers: [HTTPHeaderName.contentType: ContentType.json])
+        case .cancelled:
+            return .stream(
+                AsyncThrowingStream { $0.finish() },
+                headers: [HTTPHeaderName.contentType: ContentType.sse]
+            )
+        }
     }
 
     private func makeExchangeID(excluding requestID: String) -> String {
@@ -368,103 +379,20 @@ public actor StatelessHTTPServerTransport:
         }
     }
 
-    // MARK: - Cancellation
-
-    /// JSON-RPC error code for the synthesized "Request cancelled" response.
-    ///
-    /// MCP defines no cancellation error code; its schema designates [-32000, -32099] as
-    /// "Implementation-specific JSON-RPC error codes". This SDK already uses -32000
-    /// (connection closed) and -32001 (transport error), so -32002 is the next available.
-    private static let requestCancelledErrorCode = -32002
-
-    /// A cancellation's resolved target: the exchange to complete and the
-    /// client's stated reason, if any.
-    private struct CancelledExchange {
-        let exchangeID: String
-        let reason: String?
+    private func cancelWaitingExchange(_ exchangeID: String) {
+        guard let waiter = responseWaiters.removeValue(forKey: exchangeID) else { return }
+        removeHTTPContext(exchangeID: exchangeID, requestID: waiter.originalID)
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
-    /// Resolves a `notifications/cancelled` body to the exchange it targets and
-    /// rewrites its `params.requestId` from the client's wire id to that
-    /// exchange id — the same treatment `routingRequest` gives request ids — so
-    /// the Server can find the pending task regardless of transport state.
-    ///
-    /// Returns the body unchanged with no target when the wire id resolves to no
-    /// exchange (unknown or already completed — ignored per spec, "Invalid
-    /// cancellation notifications SHOULD be ignored") or to more than one (ids
-    /// are per-client and may legally collide; an ambiguous target fails closed:
-    /// nothing is completed here, and the Server, finding no task under the
-    /// unrouted wire id, cancels nothing).
-    private func routingCancellation(_ body: Data) -> (Data, CancelledExchange?) {
-        guard
-            let notification = try? JSONDecoder().decode(
-                Message<CancelledNotification>.self, from: body),
-            let requestID = notification.params.requestId,
-            case .string(let exchangeID)? = routedRequestID(for: requestID),
-            var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-            var params = json["params"] as? [String: Any]
-        else {
-            return (body, nil)
-        }
-        params["requestId"] = exchangeID
-        json["params"] = params
-        guard
-            let routedBody = try? JSONSerialization.data(
-                withJSONObject: json, options: [.sortedKeys, .withoutEscapingSlashes])
-        else {
-            return (body, nil)
-        }
-        return (routedBody, CancelledExchange(exchangeID: exchangeID, reason: notification.params.reason))
-    }
+    package func completeCancelledExchange(for routedID: ID, reason: String?) {
+        guard case .string(let exchangeID) = routedID,
+            let waiter = responseWaiters.removeValue(forKey: exchangeID)
+        else { return }
 
-    /// Completes the HTTP exchange for an in-flight request targeted by a
-    /// `notifications/cancelled` notification.
-    ///
-    /// Per the MCP cancellation spec, the server sends no JSON-RPC response for a
-    /// cancelled request (``Server`` suppresses it). But the Streamable HTTP transport
-    /// requires that a POST carrying a JSON-RPC request receive a response: "the server
-    /// MUST either return `Content-Type: text/event-stream` … or `Content-Type:
-    /// application/json`, to return one JSON object". Without this method, nothing
-    /// resumes the request's response waiter and the POST hangs until transport
-    /// termination.
-    ///
-    /// To satisfy that MUST, the waiter is resumed with a synthesized JSON-RPC error
-    /// response carrying the client's own id. Deviating from the cancellation SHOULD
-    /// ("Not send a response for the cancelled request") is anticipated by the same
-    /// spec: "The sender of the cancellation notification SHOULD ignore any response
-    /// to the request that arrives afterward."
-    ///
-    /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#sending-messages-to-the-server
-    /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation
-    private func completeExchange(_ cancelled: CancelledExchange) {
-        guard let waiter = responseWaiters.removeValue(forKey: cancelled.exchangeID) else {
-            // Completed between resolution and now — nothing left to answer.
-            return
-        }
-
-        var message = "Request cancelled"
-        if let reason = cancelled.reason {
-            message += ": \(reason)"
-        }
-        let response = AnyMethod.response(
-            id: waiter.originalID,
-            error: .serverError(code: Self.requestCancelledErrorCode, message: message)
-        )
-
-        do {
-            // Match the wire format Server uses for outgoing messages.
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            waiter.continuation.resume(returning: try encoder.encode(response))
-            logger.debug(
-                "Completed HTTP exchange for cancelled request",
-                metadata: ["requestID": "\(waiter.originalID)", "exchangeID": "\(cancelled.exchangeID)"]
-            )
-        } catch {
-            waiter.continuation.resume(
-                throwing: MCPError.internalError(
-                    "Failed to encode cancellation response: \(error)"))
-        }
+        removeHTTPContext(exchangeID: exchangeID, requestID: waiter.originalID)
+        logger.debug("Completed cancelled HTTP exchange", metadata: ["reason": "\(reason ?? "none")"])
+        waiter.continuation.resume(returning: .cancelled)
     }
 
     // MARK: - HTTPContextProviding
@@ -475,7 +403,10 @@ public actor StatelessHTTPServerTransport:
         {
             return request
         }
-        guard let exchangeID = exchangeIDsByRequestID[id]?.last else {
+        guard let exchangeIDs = exchangeIDsByRequestID[id],
+            exchangeIDs.count == 1,
+            let exchangeID = exchangeIDs.first
+        else {
             return nil
         }
         return httpRequestContexts[exchangeID]
