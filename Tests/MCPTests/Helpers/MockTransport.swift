@@ -31,9 +31,9 @@ actor MockTransport: Transport, HTTPContextProviding {
     private(set) var receivedMessages: [String] = []
 
     private var dataStreamContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation?
-  private var shouldBlockHTTPContext = false
-  private var requestedHTTPContextIDs: Set<ID> = []
-  private var httpContextContinuations: [ID: CheckedContinuation<Void, Never>] = [:]
+    private var shouldBlockHTTPContext = false
+    private var requestedHTTPContextIDs: Set<ID> = []
+    private var httpContextContinuations: [ID: CheckedContinuation<Void, Never>] = [:]
 
     /// How many times `receive()` has been called. Each call hands out a
     /// fresh stream, so a consumer that re-enters `receive()` after its
@@ -97,32 +97,32 @@ actor MockTransport: Transport, HTTPContextProviding {
         shouldFailSend = shouldFail
     }
 
-  func httpRequestContext(for id: ID) async -> HTTPRequest? {
-    requestedHTTPContextIDs.insert(id)
-    if shouldBlockHTTPContext {
-      await withCheckedContinuation { continuation in
-        httpContextContinuations[id] = continuation
-      }
+    func httpRequestContext(for id: ID) async -> HTTPRequest? {
+        requestedHTTPContextIDs.insert(id)
+        if shouldBlockHTTPContext {
+            await withCheckedContinuation { continuation in
+                httpContextContinuations[id] = continuation
+            }
+        }
+        return nil
     }
-    return nil
-  }
 
-  func blockHTTPContext() {
-    shouldBlockHTTPContext = true
-  }
-
-  func hasRequestedHTTPContext() -> Bool {
-    !requestedHTTPContextIDs.isEmpty
-  }
-
-  func releaseHTTPContext() {
-    shouldBlockHTTPContext = false
-    let continuations = Array(httpContextContinuations.values)
-    httpContextContinuations.removeAll()
-    for continuation in continuations {
-        continuation.resume()
+    func blockHTTPContext() {
+        shouldBlockHTTPContext = true
     }
-  }
+
+    func hasRequestedHTTPContext() -> Bool {
+        !requestedHTTPContextIDs.isEmpty
+    }
+
+    func releaseHTTPContext() {
+        shouldBlockHTTPContext = false
+        let continuations = Array(httpContextContinuations.values)
+        httpContextContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
 
     func queue(data: Data) {
         if let continuation = dataStreamContinuation {
